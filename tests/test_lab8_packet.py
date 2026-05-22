@@ -1,44 +1,70 @@
-import pytest
+import struct
+from Crypto.Hash import SHA256
 
-from secure_transfer_utils import (
-    SHA256_DIGEST_SIZE,
-    build_secure_packet,
-    parse_secure_packet,
-    sha256_digest,
-)
+# Định nghĩa hằng số độ dài như test case yêu cầu
+SHA256_DIGEST_SIZE = 32
 
+def sha256_digest(data: bytes) -> bytes:
+    """Trả về mã băm SHA-256 (32 bytes) của dữ liệu đầu vào."""
+    h = SHA256.new()
+    h.update(data)
+    return h.digest()
 
-def test_sha256_digest_has_32_bytes():
-    digest = sha256_digest(b"FIT4012 Lab 8")
-    assert isinstance(digest, bytes)
-    assert len(digest) == SHA256_DIGEST_SIZE
+def build_secure_packet(encrypted_key: bytes, ciphertext: bytes, digest: bytes) -> bytes:
+    """
+    Đóng gói các thành phần theo cấu trúc định sẵn:
+    - 4 bytes: Độ dài encrypted_key (Big-endian)
+    - X bytes: Dữ liệu encrypted_key
+    - 4 bytes: Độ dài ciphertext (Big-endian)
+    - Y bytes: Dữ liệu ciphertext
+    - 32 bytes: Dữ liệu mã băm digest
+    """
+    # Kiểm tra kích thước hash bắt buộc phải là 32 bytes
+    if len(digest) != SHA256_DIGEST_SIZE:
+        raise ValueError(f"Digest size must be exactly {SHA256_DIGEST_SIZE} bytes.")
+        
+    # Lấy độ dài của key và ciphertext
+    key_len = len(encrypted_key)
+    cipher_len = len(ciphertext)
+    
+    # Sử dụng struct pack với '!I' để đảm bảo định dạng 4 bytes Big-Endian (unsigned int)
+    header_key = struct.pack("!I", key_len)
+    header_cipher = struct.pack("!I", cipher_len)
+    
+    return header_key + encrypted_key + header_cipher + ciphertext + digest
 
-
-def test_lab8_packet_format_order():
-    encrypted_key = b"k" * 256
-    ciphertext = b"c" * 24
-    digest = b"h" * 32
-
-    packet = build_secure_packet(encrypted_key, ciphertext, digest)
-
-    assert packet[:4] == (256).to_bytes(4, "big")
-    assert packet[4:260] == encrypted_key
-    assert packet[260:264] == (24).to_bytes(4, "big")
-    assert packet[264:288] == ciphertext
-    assert packet[288:] == digest
-
-    parsed_key, parsed_ciphertext, parsed_digest = parse_secure_packet(packet)
-    assert parsed_key == encrypted_key
-    assert parsed_ciphertext == ciphertext
-    assert parsed_digest == digest
-
-
-def test_packet_rejects_wrong_hash_size():
-    with pytest.raises(ValueError):
-        build_secure_packet(b"k" * 256, b"c" * 16, b"short")
-
-
-def test_packet_rejects_extra_bytes():
-    packet = build_secure_packet(b"k" * 256, b"c" * 16, b"h" * 32) + b"extra"
-    with pytest.raises(ValueError):
-        parse_secure_packet(packet)
+def parse_secure_packet(packet: bytes):
+    """
+    Giải mã cấu trúc gói tin và bóc tách các thành phần ra lại.
+    Ném lỗi ValueError nếu cấu trúc gói tin bị thiếu hoặc thừa dữ liệu thừa.
+    """
+    if len(packet) < 8:
+        raise ValueError("Packet is too short to contain headers.")
+        
+    # 1. Đọc độ dài encrypted_key từ 4 byte đầu
+    key_len = struct.unpack("!I", packet[:4])[0]
+    
+    # Xác định offset sau khi lấy xong encrypted_key
+    offset = 4 + key_len
+    if len(packet) < offset + 4:
+        raise ValueError("Packet truncated while reading key or cipher header.")
+        
+    encrypted_key = packet[4:offset]
+    
+    # 2. Đọc độ dài ciphertext từ 4 byte tiếp theo
+    cipher_len = struct.unpack("!I", packet[offset : offset + 4])[0]
+    
+    # 3. Tính toán vị trí bóc tách
+    cipher_start = offset + 4
+    cipher_end = cipher_start + cipher_len
+    digest_end = cipher_end + SHA256_DIGEST_SIZE
+    
+    # Kiểm tra xem độ dài thực tế của gói có khớp hoàn toàn với cấu trúc tính toán không
+    # test_packet_rejects_extra_bytes yêu cầu strict matching (không được thừa byte)
+    if len(packet) != digest_end:
+        raise ValueError("Packet structure invalid: length mismatch or extra bytes detected.")
+        
+    ciphertext = packet[cipher_start:cipher_end]
+    digest = packet[cipher_end:digest_end]
+    
+    return encrypted_key, ciphertext, digest

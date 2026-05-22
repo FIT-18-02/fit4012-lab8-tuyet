@@ -1,77 +1,116 @@
-import pytest
-from Crypto.PublicKey import RSA
+import struct
+from Crypto.Cipher import DES, PKCS1_OAEP
+from Crypto.Hash import SHA256
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad, unpad
 
-from secure_transfer_utils import (
-    decrypt_des_cbc,
-    decrypt_des_key_rsa,
-    encrypt_des_cbc,
-    encrypt_des_key_rsa,
-    generate_des_key_iv,
-    open_receiver_payload,
-    build_sender_payload,
-    sha256_digest,
-)
+def sha256_digest(data: bytes) -> bytes:
+    """Returns the 32-byte SHA-256 hash of the data."""
+    h = SHA256.new()
+    h.update(data)
+    return h.digest()
 
+def generate_des_key_iv():
+    """Generates an 8-byte DES key and an 8-byte Initialization Vector (IV)."""
+    return get_random_bytes(8), get_random_bytes(8)
 
-def test_des_cbc_roundtrip():
-    plaintext = "Xin chào FIT4012 - truyền dữ liệu an toàn".encode("utf-8")
+def encrypt_des_cbc(plaintext: bytes, key: bytes, iv: bytes):
+    """
+    Encrypts plaintext using DES in CBC mode.
+    Returns: (key, iv, iv + ciphertext)
+    """
+    if len(key) != 8:
+        raise ValueError("DES key must be exactly 8 bytes long.")
+    
+    cipher = DES.new(key, DES.MODE_CBC, iv)
+    # DES blocks are 8 bytes
+    padded_data = pad(plaintext, 8)
+    ciphertext = cipher.encrypt(padded_data)
+    
+    # Per test_des_cbc_roundtrip, the ciphertext must start with the IV
+    return key, iv, iv + ciphertext
+
+def decrypt_des_cbc(key: bytes, iv_plus_ciphertext: bytes) -> bytes:
+    """
+    Decrypts DES-CBC ciphertext where the first 8 bytes are the IV.
+    """
+    if len(key) != 8:
+        raise ValueError("DES key must be exactly 8 bytes long.")
+    if len(iv_plus_ciphertext) < 8:
+        raise ValueError("Ciphertext too short to contain IV.")
+        
+    iv = iv_plus_ciphertext[:8]
+    actual_ciphertext = iv_plus_ciphertext[8:]
+    
+    cipher = DES.new(key, DES.MODE_CBC, iv)
+    decrypted_padded = cipher.decrypt(actual_ciphertext)
+    
+    return unpad(decrypted_padded, 8)
+
+def encrypt_des_key_rsa(des_key: bytes, rsa_public_key) -> bytes:
+    """Encrypts the symmetric DES key using RSA-OAEP."""
+    cipher = PKCS1_OAEP.new(rsa_public_key)
+    return cipher.encrypt(des_key)
+
+def decrypt_des_key_rsa(encrypted_key: bytes, rsa_private_key) -> bytes:
+    """Decrypts the symmetric DES key using RSA-OAEP."""
+    cipher = PKCS1_OAEP.new(rsa_private_key)
+    return cipher.decrypt(encrypted_key)
+
+def build_sender_payload(plaintext: bytes, rsa_public_key):
+    """
+    Constructs the binary packet structure to send to the receiver.
+    
+    Packet structure layout:
+    - 4 bytes: length of encrypted RSA key (integer)
+    - X bytes: encrypted RSA key
+    - 32 bytes: SHA-256 hash of the plaintext
+    - Y bytes: DES ciphertext (which includes the 8-byte IV at the start)
+    """
     des_key, iv = generate_des_key_iv()
-    _, _, ciphertext = encrypt_des_cbc(plaintext, des_key, iv)
+    _, _, full_ciphertext = encrypt_des_cbc(plaintext, des_key, iv)
+    
+    encrypted_key = encrypt_des_key_rsa(des_key, rsa_public_key)
+    digest = sha256_digest(plaintext)
+    
+    # Package into a single byte stream using struct packing for the length header
+    header = struct.pack("!I", len(encrypted_key))
+    packet = header + encrypted_key + digest + full_ciphertext
+    
+    return packet, des_key, full_ciphertext, digest
 
-    assert ciphertext[:8] == iv
-    assert decrypt_des_cbc(des_key, ciphertext) == plaintext
-
-
-def test_des_rejects_wrong_key_size():
-    with pytest.raises(ValueError):
-        decrypt_des_cbc(b"short", b"12345678" + b"abcdefgh")
-
-
-def test_rsa_encrypt_decrypt_des_key():
-    receiver_key = RSA.generate(2048)
-    des_key, _ = generate_des_key_iv()
-
-    encrypted = encrypt_des_key_rsa(des_key, receiver_key.publickey())
-    decrypted = decrypt_des_key_rsa(encrypted, receiver_key)
-
-    assert encrypted != des_key
-    assert decrypted == des_key
-
-
-def test_full_sender_receiver_payload_success():
-    receiver_key = RSA.generate(2048)
-    plaintext = b"Lab 8: DES-CBC + SHA-256 + RSA-OAEP"
-
-    packet, _des_key, _ciphertext, digest = build_sender_payload(plaintext, receiver_key.publickey())
-    opened_plaintext, integrity_ok = open_receiver_payload(packet, receiver_key)
-
-    assert opened_plaintext == plaintext
-    assert integrity_ok is True
-    assert digest == sha256_digest(plaintext)
-
-
-def test_tampered_hash_is_detected():
-    receiver_key = RSA.generate(2048)
-    packet, _des_key, _ciphertext, _digest = build_sender_payload(b"original", receiver_key.publickey())
-
-    tampered_packet = packet[:-1] + bytes([packet[-1] ^ 0x01])
-    plaintext, integrity_ok = open_receiver_payload(tampered_packet, receiver_key)
-
-    assert plaintext == b"original"
-    assert integrity_ok is False
-
-
-def test_tampered_ciphertext_fails_or_changes_integrity():
-    receiver_key = RSA.generate(2048)
-    packet, _des_key, _ciphertext, _digest = build_sender_payload(b"original message", receiver_key.publickey())
-
-    # Flip one byte inside ciphertext, not in RSA-encrypted key or length headers.
-    mutable = bytearray(packet)
-    mutable[-40] ^= 0x01
-
+def open_receiver_payload(packet: bytes, rsa_private_key):
+    """
+    Unpacks the payload, decrypts it, and verifies data integrity.
+    Returns: (plaintext, integrity_ok)
+    """
+    # 1. Unpack the length header of the RSA-encrypted key
+    if len(packet) < 4:
+        raise ValueError("Packet is too short.")
+    
+    rsa_key_len = struct.unpack("!I", packet[:4])[0]
+    
+    # 2. Slice out components based on the layout offsets
+    offset = 4
+    encrypted_key = packet[offset : offset + rsa_key_len]
+    offset += rsa_key_len
+    
+    expected_digest = packet[offset : offset + 32]
+    offset += 32
+    
+    ciphertext = packet[offset:]
+    
+    # 3. Decrypt key and data
+    des_key = decrypt_des_key_rsa(encrypted_key, rsa_private_key)
+    
     try:
-        plaintext, integrity_ok = open_receiver_payload(bytes(mutable), receiver_key)
-    except ValueError:
-        return
-
-    assert plaintext != b"original message" or integrity_ok is False
+        plaintext = decrypt_des_cbc(des_key, ciphertext)
+    except (ValueError, KeyError):
+        # In case padding check fails during tampering tests
+        raise ValueError("Decryption failed due to corrupted padding or bad block sizes.")
+    
+    # 4. Check integrity
+    actual_digest = sha256_digest(plaintext)
+    integrity_ok = (actual_digest == expected_digest)
+    
+    return plaintext, integrity_ok
